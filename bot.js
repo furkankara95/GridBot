@@ -48,52 +48,52 @@ function calcVolatility(prices) {
   return Math.sqrt(variance) * 100;
 }
 
+// index_id (ör: "BTC") → CoinGecko coin id (ör: "bitcoin") eşleştirmesi
+// /coins/list endpoint'inden çekiyoruz
+async function buildSymbolMap(indexIds) {
+  const coinList = await cgGet('/coins/list');
+  // index_id = sembol (BTC, ETH...), CoinGecko'da symbol alanıyla eşleştir
+  const map = {};
+  for (const coin of coinList) {
+    const sym = coin.symbol.toUpperCase();
+    if (indexIds.has(sym) && !map[sym]) {
+      map[sym] = coin.id; // ör: BTC → bitcoin
+    }
+  }
+  return map;
+}
+
 async function getBinanceFuturesSymbols() {
   const data = await cgGet('/derivatives');
 
-  // DEBUG: İlk 3 kaydı ve tüm unique market isimlerini logla
-  console.log('DEBUG - Toplam derivatives:', data.length);
-  if (data.length > 0) {
-    console.log('DEBUG - İlk kayıt:', JSON.stringify(data[0]));
-    const markets = [...new Set(data.map(t => t.market))];
-    console.log('DEBUG - Tüm market isimleri:', JSON.stringify(markets));
-  }
-
-  // Binance içeren tüm market isimlerini bul (büyük/küçük harf fark etmez)
+  // Binance (Futures), USDT perpetual, tekrar etmeyen index_id'ler
   const seen = new Set();
   const tickers = [];
   for (const t of data) {
-    const market = (t.market || '').toLowerCase();
     if (
-      market.includes('binance') &&
-      market.includes('future') &&
+      t.market === 'Binance (Futures)' &&
       t.symbol?.endsWith('USDT') &&
-      t.coin_id &&
-      !seen.has(t.coin_id)
+      t.contract_type === 'perpetual' &&
+      t.index_id &&
+      !seen.has(t.index_id)
     ) {
-      seen.add(t.coin_id);
-      tickers.push({ symbol: t.symbol, coinId: t.coin_id });
+      seen.add(t.index_id);
+      tickers.push({ symbol: t.symbol, indexId: t.index_id.toUpperCase() });
     }
   }
 
-  // Eğer hâlâ boşsa sadece binance içerenleri dene
-  if (tickers.length === 0) {
-    console.log('DEBUG - Futures bulunamadı, sadece binance filtreleniyor...');
-    for (const t of data) {
-      const market = (t.market || '').toLowerCase();
-      if (
-        market.includes('binance') &&
-        t.symbol?.endsWith('USDT') &&
-        t.coin_id &&
-        !seen.has(t.coin_id)
-      ) {
-        seen.add(t.coin_id);
-        tickers.push({ symbol: t.symbol, coinId: t.coin_id });
-      }
-    }
-  }
+  console.log(`${tickers.length} Binance Futures USDT perpetual bulundu`);
 
-  return tickers;
+  // index_id → coingecko id eşleştir
+  const indexIds = new Set(tickers.map(t => t.indexId));
+  console.log('Coin listesi çekiliyor...');
+  const symbolMap = await buildSymbolMap(indexIds);
+  console.log(`${Object.keys(symbolMap).length} coin eşleştirildi`);
+
+  // coin_id'si olan tickerları döndür
+  return tickers
+    .filter(t => symbolMap[t.indexId])
+    .map(t => ({ symbol: t.symbol, coinId: symbolMap[t.indexId] }));
 }
 
 async function getVolatility(coinId) {
@@ -127,23 +127,23 @@ async function checkVolatility() {
   console.log(`\n[${new Date().toISOString()}] Kontrol başladı...`);
 
   try {
-    console.log('Binance Futures sembolleri çekiliyor...');
     const tickers = await getBinanceFuturesSymbols();
-    console.log(`${tickers.length} sembol bulundu`);
-    if (tickers.length === 0) throw new Error('Sembol listesi boş - logları kontrol et');
+    console.log(`${tickers.length} sembol işlenecek`);
+    if (tickers.length === 0) throw new Error('Eşleşen sembol bulunamadı');
 
     const results = [];
     for (let i = 0; i < tickers.length; i++) {
       const { symbol, coinId } = tickers[i];
       const vol = await getVolatility(coinId);
       if (vol > 0) results.push({ symbol, volatility: vol });
-      await sleep(2100);
+      await sleep(2100); // CoinGecko demo: 30 req/dk
+
       if ((i + 1) % 20 === 0)
         console.log(`${i + 1}/${tickers.length} işlendi, ${results.length} başarılı`);
     }
 
     console.log(`Tamamlandı. ${results.length} sembol.`);
-    if (results.length === 0) throw new Error('Volatilite hesaplanamadı');
+    if (results.length === 0) throw new Error('Hiçbir volatilite hesaplanamadı');
 
     const sorted = results.sort((a, b) => b.volatility - a.volatility);
     const currentTop = sorted.slice(0, TOP_N).map(r => r.symbol);
