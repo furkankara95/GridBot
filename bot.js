@@ -4,6 +4,7 @@ const fs = require('fs');
 // ─── CONFIG ───────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY;
 const TOP_N = 10;
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STATE_FILE = './state.json';
@@ -25,7 +26,17 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// Kapanış fiyatlarından standart sapma bazlı volatilite
+// CoinGecko API çağrısı - key her istekte header olarak gönderilir
+async function cgGet(path, params = {}) {
+  const res = await axios.get(`https://api.coingecko.com/api/v3${path}`, {
+    params: { ...params, x_cg_demo_api_key: COINGECKO_API_KEY },
+    headers: { Accept: 'application/json' },
+    timeout: 15000
+  });
+  return res.data;
+}
+
+// Kapanış fiyatlarından standart sapma bazlı volatilite (TradingView yöntemi)
 function calcVolatility(prices) {
   if (prices.length < 2) return 0;
   const returns = [];
@@ -39,16 +50,12 @@ function calcVolatility(prices) {
   return Math.sqrt(variance) * 100;
 }
 
-// Binance Futures sembollerini + coin_id'lerini CoinGecko'dan çek
+// Binance Futures USDT sembollerini + coin_id'lerini çek
 async function getBinanceFuturesSymbols() {
-  const res = await axios.get('https://api.coingecko.com/api/v3/derivatives', {
-    headers: { Accept: 'application/json' },
-    timeout: 20000
-  });
-
+  const data = await cgGet('/derivatives', {});
   const seen = new Set();
   const tickers = [];
-  for (const t of res.data) {
+  for (const t of data) {
     if (
       t.market === 'Binance (Futures)' &&
       t.symbol?.endsWith('USDT') &&
@@ -62,25 +69,15 @@ async function getBinanceFuturesSymbols() {
   return tickers;
 }
 
-// CoinGecko market_chart → 7 günlük günlük fiyatlar → volatilite
-// Bu endpoint ücretsiz planda çalışır
-async function getVolatilityForCoin(coinId) {
+// 7 günlük günlük fiyatlar → volatilite
+async function getVolatility(coinId) {
   try {
-    const res = await axios.get(
-      `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart`,
-      {
-        params: {
-          vs_currency: 'usd',
-          days: '7',
-          interval: 'daily'   // Günlük kapanışlar
-        },
-        headers: { Accept: 'application/json' },
-        timeout: 10000
-      }
-    );
-
-    // prices: [[timestamp, price], ...]
-    const prices = res.data.prices.map(p => p[1]);
+    const data = await cgGet(`/coins/${coinId}/market_chart`, {
+      vs_currency: 'usd',
+      days: '7',
+      interval: 'daily'
+    });
+    const prices = data.prices.map(p => p[1]);
     return calcVolatility(prices);
   } catch (e) {
     return 0;
@@ -104,42 +101,29 @@ async function checkVolatility() {
   console.log(`\n[${new Date().toISOString()}] Kontrol başladı...`);
 
   try {
-    // 1) Sembol listesini çek
+    // 1) Sembol listesi
     console.log('Binance Futures sembolleri çekiliyor...');
     const tickers = await getBinanceFuturesSymbols();
     console.log(`${tickers.length} sembol bulundu`);
+    if (tickers.length === 0) throw new Error('Sembol listesi boş');
 
-    if (tickers.length === 0) throw new Error('Sembol listesi boş geldi');
-
-    // 2) Her coin için market_chart'tan volatilite hesapla
+    // 2) Her coin için volatilite hesapla
+    // Demo key: 30 req/dk → 2.1sn aralık
     const results = [];
-    let successCount = 0;
-    let failCount = 0;
-
     for (let i = 0; i < tickers.length; i++) {
       const { symbol, coinId } = tickers[i];
-      const vol = await getVolatilityForCoin(coinId);
-
-      if (vol > 0) {
-        results.push({ symbol, volatility: vol });
-        successCount++;
-      } else {
-        failCount++;
-      }
-
-      // CoinGecko ücretsiz: 30 req/dk → 2 saniyede 1 istek (güvenli)
+      const vol = await getVolatility(coinId);
+      if (vol > 0) results.push({ symbol, volatility: vol });
       await sleep(2100);
 
-      if ((i + 1) % 10 === 0) {
-        console.log(`${i + 1}/${tickers.length} — başarılı: ${successCount}, hata: ${failCount}`);
-      }
+      if ((i + 1) % 20 === 0)
+        console.log(`${i + 1}/${tickers.length} işlendi, ${results.length} başarılı`);
     }
 
-    console.log(`Tamamlandı. ${successCount} sembol işlendi.`);
+    console.log(`Tamamlandı. ${results.length} sembol hesaplandı.`);
+    if (results.length === 0) throw new Error('Hiçbir volatilite hesaplanamadı');
 
-    if (results.length === 0) throw new Error('Hiçbir sembol için volatilite hesaplanamadı');
-
-    // 3) Sırala, Top N al
+    // 3) Sırala, Top N
     const sorted = results.sort((a, b) => b.volatility - a.volatility);
     const currentTop = sorted.slice(0, TOP_N).map(r => r.symbol);
     console.log('Top 10:', currentTop);
@@ -151,15 +135,10 @@ async function checkVolatility() {
     const exitedEntries = previousTop.filter(s => !currentTop.includes(s));
 
     // 5) Mesaj gönder
-    const buildMsg = (title) => {
-      let msg = `${title}\n`;
-      msg += `📅 ${new Date().toLocaleString('tr-TR')}\n`;
-      msg += `📡 <i>CoinGecko 7 Günlük Gerçek Volatilite</i>\n\n`;
-      return msg;
-    };
-
     if (previousTop.length === 0) {
-      let msg = buildMsg(`✅ <b>Volatilite Botu Başladı!</b>`);
+      let msg = `✅ <b>Volatilite Botu Başladı!</b>\n`;
+      msg += `📅 ${new Date().toLocaleString('tr-TR')}\n`;
+      msg += `📡 <i>CoinGecko — Gerçek 7 Günlük Volatilite</i>\n\n`;
       msg += `📊 <b>İlk Top ${TOP_N}:</b>\n`;
       for (let i = 0; i < currentTop.length; i++) {
         const info = sorted.find(r => r.symbol === currentTop[i]);
@@ -169,21 +148,21 @@ async function checkVolatility() {
       await sendTelegram(msg);
 
     } else if (newEntries.length > 0 || exitedEntries.length > 0) {
-      let msg = buildMsg(`🚨 <b>Top ${TOP_N} Listesi Değişti!</b>`);
+      let msg = `🚨 <b>Top ${TOP_N} Listesi Değişti!</b>\n`;
+      msg += `📅 ${new Date().toLocaleString('tr-TR')}\n`;
+      msg += `📡 <i>CoinGecko — Gerçek 7 Günlük Volatilite</i>\n\n`;
 
       if (newEntries.length > 0) {
         msg += `✅ <b>Listeye Girenler:</b>\n`;
         for (const sym of newEntries) {
           const info = sorted.find(r => r.symbol === sym);
-          const rank = currentTop.indexOf(sym) + 1;
-          msg += `  #${rank} ${sym} — %${info.volatility.toFixed(2)}\n`;
+          msg += `  #${currentTop.indexOf(sym) + 1} ${sym} — %${info.volatility.toFixed(2)}\n`;
         }
       }
       if (exitedEntries.length > 0) {
         msg += `\n❌ <b>Listeden Çıkanlar:</b>\n`;
         for (const sym of exitedEntries) msg += `  ${sym}\n`;
       }
-
       msg += `\n📊 <b>Güncel Top ${TOP_N}:</b>\n`;
       for (let i = 0; i < currentTop.length; i++) {
         const info = sorted.find(r => r.symbol === currentTop[i]);
@@ -192,7 +171,7 @@ async function checkVolatility() {
       await sendTelegram(msg);
 
     } else {
-      console.log('Liste değişmedi, mesaj gönderilmedi');
+      console.log('Liste değişmedi');
     }
 
     saveState({ topList: currentTop, lastCheck: new Date().toISOString() });
@@ -205,8 +184,8 @@ async function checkVolatility() {
 
 (async () => {
   console.log('🤖 Volatilite botu başlıyor...');
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.error('❌ Env değişkenleri eksik!');
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID || !COINGECKO_API_KEY) {
+    console.error('❌ Eksik env: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, COINGECKO_API_KEY');
     process.exit(1);
   }
   await checkVolatility();
