@@ -6,7 +6,7 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY;
 const TOP_N = 10;
-const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const CHECK_INTERVAL_MS = 3 * 24 * 60 * 60 * 1000; // 3 gün
 const STATE_FILE = './state.json';
 // ──────────────────────────────────────────────────────────
 
