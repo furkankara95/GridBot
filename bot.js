@@ -8,15 +8,14 @@ const TOP_N = 10;
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 1 gün
 const STATE_FILE = './state.json';
 const BACKTEST_CAPITAL = 1000;
-const COMMISSION = 0.00025; // %0.025
+const COMMISSION = 0.00025;
 // ──────────────────────────────────────────────────────────
 
-// 4 backtest periyodu - hepsi 1h mumlarla
 const PERIODS = [
-  { label: '1 Günlük',  hours: 24  },
-  { label: '3 Günlük',  hours: 72  },
-  { label: '5 Günlük',  hours: 120 },
-  { label: '10 Günlük', hours: 240 },
+  { label: '1G',  hours: 24  },
+  { label: '3G',  hours: 72  },
+  { label: '5G',  hours: 120 },
+  { label: '10G', hours: 240 },
 ];
 
 function loadState() {
@@ -35,7 +34,6 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// Standart sapma bazlı volatilite (günlük mumlardan)
 function calcVolatility(closes) {
   if (closes.length < 2) return 0;
   const returns = [];
@@ -49,265 +47,200 @@ function calcVolatility(closes) {
   return Math.sqrt(variance) * 100;
 }
 
-// Grid hesabı
-function calcGrid(low, high) {
+// Grid sayısı: toplam aralığı %1'e böl
+function calcGridQty(low, high) {
   const totalRange = ((high - low) / low) * 100;
-  const maxGrids = Math.ceil(totalRange / 1); // %1 aralık = max grid
-  return { low, high, totalRange, maxGrids };
+  return { totalRange, gridQty: Math.ceil(totalRange / 1) };
 }
 
-// Grid Bot Backtest (Pine Script mantığı - 1h mumlarla)
+// Backtest - sabit low/high, değişen 1h mum dilimi
 function runBacktest(candles, lowerBound, upperBound, gridQty) {
   if (candles.length === 0 || gridQty < 2) return null;
 
-  const gridWidth = (upperBound - lowerBound) / (gridQty - 1);
-  const gridLines = [];
-  for (let i = 0; i < gridQty; i++) {
-    gridLines.push(lowerBound + gridWidth * i);
-  }
-
+  const gridWidth  = (upperBound - lowerBound) / (gridQty - 1);
+  const gridLines  = Array.from({ length: gridQty }, (_, i) => lowerBound + gridWidth * i);
   const qtyPerGrid = BACKTEST_CAPITAL / (gridQty - 1);
   const orderArr   = new Array(gridQty).fill(false);
   const orderQty   = new Array(gridQty).fill(0);
   const orderPrice = new Array(gridQty).fill(0);
 
-  let netProfit  = 0;
-  let totalFee   = 0;
-  let tradeCount = 0;
+  let netProfit = 0, totalFee = 0, tradeCount = 0;
 
   for (const candle of candles) {
     const close = parseFloat(candle[4]);
     if (close <= 0) continue;
 
     for (let i = 0; i < gridLines.length; i++) {
-      // AL
       if (close < gridLines[i] && !orderArr[i] && i < gridLines.length - 1) {
         const qty = qtyPerGrid / close;
-        const fee = qty * close * COMMISSION;
-        orderArr[i]   = true;
-        orderQty[i]   = qty;
-        orderPrice[i] = close;
-        totalFee += fee;
+        orderArr[i] = true; orderQty[i] = qty; orderPrice[i] = close;
+        totalFee += qty * close * COMMISSION;
       }
-      // SAT
       if (close > gridLines[i] && i !== 0 && orderArr[i - 1]) {
-        const buyQty   = orderQty[i - 1];
-        const buyPrice = orderPrice[i - 1];
-        const sellFee  = buyQty * close * COMMISSION;
-        const buyFee   = buyQty * buyPrice * COMMISSION;
-        netProfit += buyQty * (close - buyPrice) - sellFee - buyFee;
-        totalFee  += sellFee;
+        const bQty = orderQty[i - 1], bPrice = orderPrice[i - 1];
+        netProfit += bQty * (close - bPrice) - bQty * close * COMMISSION - bQty * bPrice * COMMISSION;
+        totalFee  += bQty * close * COMMISSION;
         tradeCount++;
-        orderArr[i - 1]   = false;
-        orderQty[i - 1]   = 0;
-        orderPrice[i - 1] = 0;
+        orderArr[i-1] = false; orderQty[i-1] = 0; orderPrice[i-1] = 0;
       }
     }
   }
 
-  // Unrealized P&L
-  const lastClose = parseFloat(candles[candles.length - 1][4]);
-  let openProfit = 0;
-  for (let i = 0; i < gridLines.length; i++) {
-    if (orderArr[i]) {
-      openProfit += orderQty[i] * (lastClose - orderPrice[i]);
-    }
-  }
+  const lastClose  = parseFloat(candles[candles.length - 1][4]);
+  const openProfit = gridLines.reduce((sum, _, i) =>
+    orderArr[i] ? sum + orderQty[i] * (lastClose - orderPrice[i]) : sum, 0);
 
-  const totalProfit = netProfit + openProfit;
-  const profitPct   = (totalProfit / BACKTEST_CAPITAL) * 100;
+  const total    = netProfit + openProfit;
+  const pct      = (total / BACKTEST_CAPITAL) * 100;
 
   return {
-    netProfit:    netProfit.toFixed(2),
-    openProfit:   openProfit.toFixed(2),
-    totalProfit:  totalProfit.toFixed(2),
-    profitPct:    profitPct.toFixed(2),
-    finalBalance: (BACKTEST_CAPITAL + totalProfit).toFixed(2),
-    totalFee:     totalFee.toFixed(2),
-    tradeCount,
+    profit:  total.toFixed(2),
+    pct:     pct.toFixed(2),
+    balance: (BACKTEST_CAPITAL + total).toFixed(2),
+    trades:  tradeCount,
+    fee:     totalFee.toFixed(2),
   };
 }
 
-// Binance - 1h mumları çek (limit: saat sayısı)
-async function get1hCandles(symbol, hours) {
-  const res = await axios.get('https://fapi.binance.com/fapi/v1/klines', {
-    params: { symbol, interval: '1h', limit: hours },
-    timeout: 10000
-  });
-  return res.data;
-}
-
-// Binance - günlük mumlar (volatilite için)
-async function getDailyCandles(symbol) {
-  const res = await axios.get('https://fapi.binance.com/fapi/v1/klines', {
-    params: { symbol, interval: '1d', limit: 10 },
-    timeout: 10000
-  });
-  return res.data;
-}
-
-// Binance Futures sembolleri
 async function getBinanceSymbols() {
-  const res = await axios.get('https://fapi.binance.com/fapi/v1/exchangeInfo', {
-    timeout: 15000
-  });
+  const res = await axios.get('https://fapi.binance.com/fapi/v1/exchangeInfo', { timeout: 15000 });
   return res.data.symbols
     .filter(s => s.quoteAsset === 'USDT' && s.contractType === 'PERPETUAL' && s.status === 'TRADING')
     .map(s => s.symbol);
 }
 
-// Her sembol için tüm veriyi çek
 async function getSymbolData(symbol) {
   try {
-    // Volatilite için günlük mumlar
-    const dailyCandles = await getDailyCandles(symbol);
-    if (dailyCandles.length < 2) return null;
-
-    const closes    = dailyCandles.map(k => parseFloat(k[4]));
-    const volatility = calcVolatility(closes);
-
-    // 10G high/low (günlük)
-    const highs  = dailyCandles.map(k => parseFloat(k[2]));
-    const lows   = dailyCandles.map(k => parseFloat(k[3]));
-    const high10 = Math.max(...highs);
-    const low10  = Math.min(...lows);
-
-    // 4 periyot için 1h mumları çek (en uzun olan 240h, hepsini kapsıyor)
-    const candles1h = await get1hCandles(symbol, 240);
-
-    // Her periyot için high/low ve candle dilimi
-    const periods = PERIODS.map(p => {
-      const slice    = candles1h.slice(-p.hours);
-      const pHighs   = slice.map(k => parseFloat(k[2]));
-      const pLows    = slice.map(k => parseFloat(k[3]));
-      const pHigh    = Math.max(...pHighs);
-      const pLow     = Math.min(...pLows);
-      const grid     = calcGrid(pLow, pHigh);
-      const bt       = runBacktest(slice, pLow, pHigh, grid.maxGrids);
-      return { ...p, pHigh, pLow, grid, bt, candles: slice };
+    // Günlük mumlar → volatilite
+    const daily = await axios.get('https://fapi.binance.com/fapi/v1/klines', {
+      params: { symbol, interval: '1d', limit: 10 }, timeout: 10000
     });
+    if (daily.data.length < 2) return null;
+    const volatility = calcVolatility(daily.data.map(k => parseFloat(k[4])));
 
-    return { symbol, volatility, high10, low10, periods };
+    // 10G high/low (günlük) — tüm backtestler için SABİT
+    const high10 = Math.max(...daily.data.map(k => parseFloat(k[2])));
+    const low10  = Math.min(...daily.data.map(k => parseFloat(k[3])));
+    const { totalRange, gridQty } = calcGridQty(low10, high10);
+
+    // 1h mumlar (240 saat = 10 gün, hepsini kapsıyor)
+    const hourly = await axios.get('https://fapi.binance.com/fapi/v1/klines', {
+      params: { symbol, interval: '1h', limit: 240 }, timeout: 10000
+    });
+    const candles1h = hourly.data;
+
+    // 4 periyot için backtest — hepsi aynı low10/high10 ile
+    const backtests = PERIODS.map(p => ({
+      label: p.label,
+      bt:    runBacktest(candles1h.slice(-p.hours), low10, high10, gridQty)
+    }));
+
+    return { symbol, volatility, high10, low10, totalRange, gridQty, backtests };
   } catch (e) {
     return null;
   }
 }
 
+const fmt = (n) => n < 0.001 ? n.toFixed(6) : n < 0.1 ? n.toFixed(5) : n < 1 ? n.toFixed(4) : n.toFixed(3);
+
+function buildCoinMessage(rank, d) {
+  const gridPerUsdt = (BACKTEST_CAPITAL / (d.gridQty - 1)).toFixed(2);
+
+  let msg = `<b>${rank}. ${d.symbol}</b>  Vlt: %${d.volatility.toFixed(2)}\n`;
+  msg += `📈 <code>${fmt(d.high10)}</code>  📉 <code>${fmt(d.low10)}</code>  Aralık: %${d.totalRange.toFixed(1)}\n`;
+  msg += `Grid: ${d.gridQty} adet  |  Grid başı: ${gridPerUsdt} USDT\n`;
+  msg += `\n`;
+
+  for (const { label, bt } of d.backtests) {
+    if (!bt) { msg += `${label}: veri yok\n`; continue; }
+    const sign = parseFloat(bt.profit) >= 0 ? '✅' : '❌';
+    msg += `${sign} <b>${label}</b>  ${bt.profit > 0 ? '+' : ''}${bt.profit}$ (%${bt.pct})  ${bt.trades} işlem\n`;
+  }
+
+  return msg;
+}
+
 async function sendTelegram(message) {
   try {
     await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      chat_id: TELEGRAM_CHAT_ID,
-      text: message,
-      parse_mode: 'HTML'
+      chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML'
     });
   } catch (e) {
     console.error('Telegram hatası:', e.message);
   }
 }
 
-// Fiyat formatlayıcı
-const fmt = (n) => n < 0.001 ? n.toFixed(6) : n < 0.1 ? n.toFixed(5) : n < 1 ? n.toFixed(4) : n.toFixed(3);
-
-function buildCoinMessage(rank, data) {
-  const { symbol, volatility, periods } = data;
-
-  let msg = `<b>${rank}. ${symbol}</b> — Volatilite: %${volatility.toFixed(2)}\n`;
-  msg += `━━━━━━━━━━━━━━━━━\n`;
-
-  for (const p of periods) {
-    const { label, pHigh, pLow, grid, bt } = p;
-    const profitEmoji = bt && parseFloat(bt.totalProfit) >= 0 ? '✅' : '❌';
-    const gridPerGrid = (BACKTEST_CAPITAL / (grid.maxGrids - 1)).toFixed(2);
-
-    msg += `\n📆 <b>${label} (1H)</b>\n`;
-    msg += `   📈 Yüksek: <code>${fmt(pHigh)}</code>  📉 Düşük: <code>${fmt(pLow)}</code>\n`;
-    msg += `   Aralık: %${grid.totalRange.toFixed(2)} | Grid: ${grid.maxGrids} | Grid/USDT: ${gridPerGrid}\n`;
-    if (bt) {
-      msg += `   ${profitEmoji} Kâr: ${bt.totalProfit} USDT (%${bt.profitPct}) | ${bt.tradeCount} işlem\n`;
-      msg += `   💰 Son Bakiye: ${bt.finalBalance} USDT | Komisyon: ${bt.totalFee} USDT\n`;
-    }
-  }
-
-  return msg;
-}
-
 async function checkVolatility() {
   console.log(`\n[${new Date().toISOString()}] Kontrol başladı...`);
-
   try {
-    console.log('Binance Futures sembolleri çekiliyor...');
     const symbols = await getBinanceSymbols();
-    console.log(`${symbols.length} sembol bulundu`);
+    console.log(`${symbols.length} sembol`);
 
     const results = [];
-    const batchSize = 10; // 1h veri de çektiğimiz için batch küçüldü
-
-    for (let i = 0; i < symbols.length; i += batchSize) {
-      const batch = symbols.slice(i, i + batchSize);
-      const batchResults = await Promise.all(batch.map(sym => getSymbolData(sym)));
-      results.push(...batchResults.filter(r => r && r.volatility > 0));
+    for (let i = 0; i < symbols.length; i += 10) {
+      const batch = await Promise.all(symbols.slice(i, i + 10).map(getSymbolData));
+      results.push(...batch.filter(r => r && r.volatility > 0));
       await sleep(500);
-      if (i % 50 === 0 && i > 0)
-        console.log(`${i}/${symbols.length} işlendi...`);
+      if (i % 50 === 0 && i > 0) console.log(`${i}/${symbols.length}...`);
     }
-
-    console.log(`${results.length} sembol hesaplandı`);
-    if (results.length === 0) throw new Error('Hiçbir veri hesaplanamadı');
 
     const sorted     = results.sort((a, b) => b.volatility - a.volatility);
     const topResults = sorted.slice(0, TOP_N);
     const currentTop = topResults.map(r => r.symbol);
     console.log('Top 10:', currentTop);
 
-    const state       = loadState();
-    const previousTop = state.topList || [];
-    const newEntries  = currentTop.filter(s => !previousTop.includes(s));
+    const state         = loadState();
+    const previousTop   = state.topList || [];
+    const newEntries    = currentTop.filter(s => !previousTop.includes(s));
     const exitedEntries = previousTop.filter(s => !currentTop.includes(s));
 
-    const sendFullReport = async (title) => {
-      // Özet
-      let header = `${title}\n`;
-      header += `📅 ${new Date().toLocaleString('tr-TR')}\n`;
-      header += `📡 <i>Binance Futures | 7G Volatilite | Backtest $${BACKTEST_CAPITAL} (1H mumlar)</i>\n`;
-      header += `━━━━━━━━━━━━━━━━━━━━\n`;
-      header += topResults.map((r, i) => `${i + 1}. ${r.symbol} — %${r.volatility.toFixed(2)}`).join('\n');
-      await sendTelegram(header);
-      await sleep(500);
-
-      // Her coin detayı
+    const sendReport = async (title) => {
+      // Tek mesajda özet + tüm coinler
+      let msg = `${title}\n`;
+      msg += `📅 ${new Date().toLocaleString('tr-TR')} | $${BACKTEST_CAPITAL} | Low/High: 10G sabit\n`;
+      msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
       for (let i = 0; i < topResults.length; i++) {
-        await sendTelegram(buildCoinMessage(i + 1, topResults[i]));
+        msg += buildCoinMessage(i + 1, topResults[i]);
+        msg += '\n';
+      }
+      // Telegram 4096 karakter limiti — uzunsa böl
+      if (msg.length <= 4096) {
+        await sendTelegram(msg);
+      } else {
+        // Başlık + her coin ayrı mesaj
+        let header = `${title}\n📅 ${new Date().toLocaleString('tr-TR')}\n━━━━━━━━━━━━━━━━━━━━\n`;
+        header += topResults.map((r, i) => `${i+1}. ${r.symbol} — %${r.volatility.toFixed(2)}`).join('\n');
+        await sendTelegram(header);
         await sleep(400);
+        for (let i = 0; i < topResults.length; i++) {
+          await sendTelegram(buildCoinMessage(i + 1, topResults[i]));
+          await sleep(300);
+        }
       }
     };
 
     if (previousTop.length === 0) {
-      await sendFullReport(`✅ <b>Volatilite Botu Başladı!</b>`);
-
+      await sendReport(`✅ <b>Volatilite Botu Başladı!</b>`);
     } else if (newEntries.length > 0 || exitedEntries.length > 0) {
-      let summary = `🚨 <b>Top ${TOP_N} Listesi Değişti!</b>\n`;
-      summary += `📅 ${new Date().toLocaleString('tr-TR')}\n\n`;
+      let change = `🚨 <b>Top ${TOP_N} Değişti!</b>  📅 ${new Date().toLocaleString('tr-TR')}\n\n`;
       if (newEntries.length > 0) {
-        summary += `✅ <b>Listeye Girenler:</b>\n`;
-        for (const sym of newEntries) {
-          const info = topResults.find(r => r.symbol === sym);
-          summary += `  #${currentTop.indexOf(sym) + 1} ${sym} — %${info.volatility.toFixed(2)}\n`;
-        }
+        change += `✅ Girenler: `;
+        change += newEntries.map(s => {
+          const info = topResults.find(r => r.symbol === s);
+          return `${s} %${info.volatility.toFixed(2)}`;
+        }).join(', ') + '\n';
       }
       if (exitedEntries.length > 0) {
-        summary += `\n❌ <b>Listeden Çıkanlar:</b>\n`;
-        for (const sym of exitedEntries) summary += `  ${sym}\n`;
+        change += `❌ Çıkanlar: ${exitedEntries.join(', ')}\n`;
       }
-      await sendTelegram(summary);
-      await sleep(500);
-      await sendFullReport(`📊 <b>Güncel Top ${TOP_N} — Detaylar</b>`);
-
+      await sendTelegram(change);
+      await sleep(400);
+      await sendReport(`📊 <b>Güncel Top ${TOP_N}</b>`);
     } else {
       console.log('Liste değişmedi');
     }
 
     saveState({ topList: currentTop, lastCheck: new Date().toISOString() });
-
   } catch (e) {
     console.error('Kritik hata:', e.message);
     await sendTelegram(`⚠️ Bot hatası: ${e.message}`);
